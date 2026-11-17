@@ -189,6 +189,7 @@ static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP
     // FEC recovery packets are synthesized by us, so don't use them to determine OOS data
     if (!isFecRecovery) {
         if (outOfSequence) {
+            atomic_fetch_add_explicit(&queue->stats.packetCountOOS, 1, memory_order_relaxed);
             // This packet was received after a higher sequence number packet, so note that we
             // received an out of order packet to disable our speculative RFI recovery logic.
             queue->lastOosFramePresentationTimestamp = newEntry->presentationTimeUs;
@@ -211,6 +212,7 @@ static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP
 }
 
 #define PACKET_RECOVERY_FAILURE()                     \
+    atomic_fetch_add_explicit(&queue->stats.packetCountFecInvalid, 1, memory_order_relaxed); \
     ret = -1;                                         \
     Limelog("FEC recovery returned corrupt packet %d" \
             " (frame %d)", rtpPacket->sequenceNumber, \
@@ -475,7 +477,9 @@ cleanup_packets:
                 // it may be a legitimate part of the H.264 bytestream.
 
                 LC_ASSERT(isBefore16(rtpPacket->sequenceNumber, queue->bufferFirstParitySequenceNumber));
-                queuePacket(queue, queueEntry, rtpPacket, StreamConfig.packetSize + dataOffset, false, true);
+                if (queuePacket(queue, queueEntry, rtpPacket, StreamConfig.packetSize + dataOffset, false, true)) {
+                    atomic_fetch_add_explicit(&queue->stats.packetCountFecRecovered, 1, memory_order_relaxed);
+                }
             } else if (packets[i] != NULL) {
                 free(packets[i]);
             }
@@ -794,6 +798,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
     if (length < dataOffset + (int)sizeof(NV_VIDEO_PACKET)) {
         // Reject packets that are too small to fit a NV_VIDEO_PACKET header
+        atomic_fetch_add_explicit(&queue->stats.packetCountInvalid, 1, memory_order_relaxed);
         return RTPF_RET_REJECTED;
     }
 
@@ -856,6 +861,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 }
             }
             else if (queue->multiFecLastBlockNumber != 0) {
+                atomic_fetch_add_explicit(&queue->stats.packetCountFecFailed, 1, memory_order_relaxed);
                 Limelog("Unrecoverable frame %d (block %d of %d): %d+%d=%d received < %d needed\n",
                         queue->currentFrameNumber, queue->multiFecCurrentBlockNumber+1,
                         queue->multiFecLastBlockNumber+1,
@@ -886,6 +892,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 }
             }
             else {
+                atomic_fetch_add_explicit(&queue->stats.packetCountFecFailed, 1, memory_order_relaxed);
                 Limelog("Unrecoverable frame %d: %d+%d=%d received < %d needed\n",
                         queue->currentFrameNumber, queue->receivedDataPackets,
                         queue->receivedParityPackets,
@@ -901,6 +908,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
 
+            atomic_fetch_add_explicit(&queue->stats.packetCountFecFailed,
+                                      (uint8_t)(fecCurrentBlockNumber - expectedFecBlockNumber), memory_order_relaxed);
             Limelog("Unrecoverable frame %d: lost FEC blocks %d to %d\n",
                     nvPacket->frameIndex,
                     expectedFecBlockNumber + 1,
